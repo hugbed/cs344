@@ -81,6 +81,84 @@
 
 #include "utils.h"
 
+__global__ 
+void max_reduce(float* d_out,
+				const float* const d_in,
+				const size_t numRows,
+				const size_t numCols)
+{
+	extern __shared__ float stmp[];
+	
+	int2 tId2 = make_int2(blockIdx.x * blockDim.x + threadIdx.x, 
+						  blockIdx.y * blockDim.y + threadIdx.y);
+		
+	// make sure not to access out of bound memory
+	if (tId2.x >= numCols || tId2.y >= numRows) {
+		return;
+	}
+	
+	// load data into shared memory (one value per thread)
+	int tId_in = tId2.y * numCols + tId2.x;
+	int tId_s = threadIdx.y * blockDim.x + threadIdx.x;
+	stmp[tId_s] = d_in[tId_in];
+	__syncthreads();
+	
+	for (unsigned int s = blockDim.x/2; s > 0; s >>= 1) {
+		if (threadIdx.x < s) {
+			stmp[tId_s] = max(stmp[tId_s], stmp[tId_s + s]);
+			__syncthreads();
+			
+			if (threadIdx.y < s) {
+				stmp[tId_s] = max(stmp[tId_s], stmp[tId_s + s*blockDim.x]);
+			}
+			__syncthreads();
+		}
+	}
+	
+	if (tId_s == 0) {
+		d_out[blockIdx.y*gridDim.x + blockIdx.x] = stmp[0];
+	}
+}
+
+__global__ 
+void min_reduce(float* d_out,
+				const float* const d_in,
+				const size_t numRows,
+				const size_t numCols)
+{
+	extern __shared__ float stmp[];
+	
+	int2 tId2 = make_int2(blockIdx.x * blockDim.x + threadIdx.x, 
+						  blockIdx.y * blockDim.y + threadIdx.y);
+		
+	// make sure not to access out of bound memory
+	if (tId2.x >= numCols || tId2.y >= numRows) {
+		return;
+	}
+	
+	// load data into shared memory (one value per thread)
+	int tId_in = tId2.y * numCols + tId2.x;
+	int tId_s = threadIdx.y * blockDim.x + threadIdx.x;
+	stmp[tId_s] = d_in[tId_in];
+	__syncthreads();
+	
+	for (unsigned int s = blockDim.x/2; s > 0; s >>= 1) {
+		if (threadIdx.x < s) {
+			stmp[tId_s] = min(stmp[tId_s], stmp[tId_s + s]);
+			__syncthreads();
+			
+			if (threadIdx.y < s) {
+				stmp[tId_s] = min(stmp[tId_s], stmp[tId_s + s*blockDim.x]);
+			}
+			__syncthreads();
+		}
+	}
+	
+	if (tId_s == 0) {
+		d_out[blockIdx.y*gridDim.x + blockIdx.x] = stmp[0];
+	}
+}
+
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
                                   float &min_logLum,
@@ -99,6 +177,25 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
     4) Perform an exclusive scan (prefix sum) on the histogram to get
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
-
-
+	
+	const dim3 blockSize(16, 16);
+	const dim3 gridSize(numCols/blockSize.x+1, numRows/blockSize.y+1);
+	
+	float *d_intermediate, *d_out;
+	checkCudaErrors(cudaMalloc(&d_intermediate, blockSize.x*blockSize.y*sizeof(float)));
+	checkCudaErrors(cudaMalloc(&d_out, sizeof(float)));
+	
+	float h_out;
+	max_reduce<<<gridSize, blockSize, blockSize.x*blockSize.y*sizeof(float)>>>(d_intermediate, d_logLuminance, numRows, numCols);
+	max_reduce<<<gridSize, blockSize, blockSize.x*blockSize.y*sizeof(float)>>>(d_out, d_intermediate, numRows, numCols);
+	checkCudaErrors(cudaMemcpy(&h_out, d_out, sizeof(float), cudaMemcpyDeviceToHost));
+	max_logLum = h_out;
+	
+	min_reduce<<<gridSize, blockSize, blockSize.x*blockSize.y*sizeof(float)>>>(d_intermediate, d_logLuminance, numRows, numCols);
+	min_reduce<<<gridSize, blockSize, blockSize.x*blockSize.y*sizeof(float)>>>(d_out, d_intermediate, numRows, numCols);
+	checkCudaErrors(cudaMemcpy(&h_out, d_out, sizeof(float), cudaMemcpyDeviceToHost));
+	min_logLum = h_out;
+	
+	checkCudaErrors(cudaFree(d_intermediate));
+	checkCudaErrors(cudaFree(d_out));
 }
