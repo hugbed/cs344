@@ -81,82 +81,217 @@
 
 #include "utils.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+
+#define OP_MAX 3
+#define OP_MIN 2
+
+#define THREADBLOCK_SIZE 256
+
+typedef unsigned int uint;
+
 __global__ 
-void max_reduce(float* d_out,
-				const float* const d_in,
-				const size_t numRows,
-				const size_t numCols)
+void reduce(float* d_out,
+			const float* const d_in,
+			const unsigned int op)
 {
 	extern __shared__ float stmp[];
-	
-	int2 tId2 = make_int2(blockIdx.x * blockDim.x + threadIdx.x, 
-						  blockIdx.y * blockDim.y + threadIdx.y);
-		
-	// make sure not to access out of bound memory
-	if (tId2.x >= numCols || tId2.y >= numRows) {
-		return;
-	}
-	
+
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+
 	// load data into shared memory (one value per thread)
-	int tId_in = tId2.y * numCols + tId2.x;
-	int tId_s = threadIdx.y * blockDim.x + threadIdx.x;
-	stmp[tId_s] = d_in[tId_in];
+	int tid = threadIdx.x;
+	stmp[tid] = d_in[i];
 	__syncthreads();
-	
-	for (unsigned int s = blockDim.x/2; s > 0; s >>= 1) {
-		if (threadIdx.x < s) {
-			stmp[tId_s] = max(stmp[tId_s], stmp[tId_s + s]);
-			__syncthreads();
-			
-			if (threadIdx.y < s) {
-				stmp[tId_s] = max(stmp[tId_s], stmp[tId_s + s*blockDim.x]);
+
+	for (unsigned int s = blockDim.x >> 1; s > 0; s >>= 1) {
+		if (tid < s) {
+			if (op == OP_MAX) {
+				stmp[tid] = max(stmp[tid], stmp[tid + s]);
+			} else if (op == OP_MIN){
+				stmp[tid] = min(stmp[tid], stmp[tid + s]);
 			}
-			__syncthreads();
 		}
+		__syncthreads();
 	}
-	
-	if (tId_s == 0) {
-		d_out[blockIdx.y*gridDim.x + blockIdx.x] = stmp[0];
+
+	if (tid == 0) {
+		d_out[blockIdx.x] = stmp[0];
 	}
 }
 
-__global__ 
-void min_reduce(float* d_out,
-				const float* const d_in,
-				const size_t numRows,
-				const size_t numCols)
+__global__
+void histogram(uint* d_bins,
+			   const float* const d_in,
+			   const float lumMin,
+			   const float lumMax,
+			   const size_t numBins)
 {
-	extern __shared__ float stmp[];
-	
-	int2 tId2 = make_int2(blockIdx.x * blockDim.x + threadIdx.x, 
-						  blockIdx.y * blockDim.y + threadIdx.y);
-		
-	// make sure not to access out of bound memory
-	if (tId2.x >= numCols || tId2.y >= numRows) {
-		return;
-	}
-	
+	extern __shared__ float s_in[];
+
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+
 	// load data into shared memory (one value per thread)
-	int tId_in = tId2.y * numCols + tId2.x;
-	int tId_s = threadIdx.y * blockDim.x + threadIdx.x;
-	stmp[tId_s] = d_in[tId_in];
+	int tid = threadIdx.x;
+	s_in[tid] = d_in[i];
 	__syncthreads();
-	
-	for (unsigned int s = blockDim.x/2; s > 0; s >>= 1) {
-		if (threadIdx.x < s) {
-			stmp[tId_s] = min(stmp[tId_s], stmp[tId_s + s]);
-			__syncthreads();
-			
-			if (threadIdx.y < s) {
-				stmp[tId_s] = min(stmp[tId_s], stmp[tId_s + s*blockDim.x]);
-			}
-			__syncthreads();
-		}
-	}
-	
-	if (tId_s == 0) {
-		d_out[blockIdx.y*gridDim.x + blockIdx.x] = stmp[0];
-	}
+
+	// could initialize to 0 some way here
+	// here <--
+
+	// could build histogram in shared memory, then
+	// merge it to global histogram
+
+	float lumRange = lumMax - lumMin;
+	unsigned int binIdx = (s_in[tid] - lumMin) / lumRange * numBins;
+
+	// could probably be faster somehow else
+	atomicAdd(&(d_bins[binIdx]), 1);
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+// Basic scan codelets
+////////////////////////////////////////////////////////////////////////////////
+//Naive inclusive scan: O(N * log2(N)) operations
+//Allocate 2 * 'size' local memory, initialize the first half
+//with 'size' zeros avoiding if(pos >= offset) condition evaluation
+//and saving instructions
+inline __device__ uint scan1Inclusive(uint idata, volatile uint *s_Data, uint size)
+{
+    uint pos = 2 * threadIdx.x - (threadIdx.x & (size - 1));
+    s_Data[pos] = 0;
+    pos += size;
+    s_Data[pos] = idata;
+
+    for (uint offset = 1; offset < size; offset <<= 1)
+    {
+        __syncthreads();
+        uint t = s_Data[pos] + s_Data[pos - offset];
+        __syncthreads();
+        s_Data[pos] = t;
+    }
+
+    return s_Data[pos];
+}
+
+inline __device__ uint scan1Exclusive(uint idata, volatile uint *s_Data, uint size)
+{
+    return scan1Inclusive(idata, s_Data, size) - idata;
+}
+
+
+inline __device__ uint4 scan4Inclusive(uint4 idata4, volatile uint *s_Data, uint size)
+{
+    //Level-0 inclusive scan
+    idata4.y += idata4.x;
+    idata4.z += idata4.y;
+    idata4.w += idata4.z;
+
+    //Level-1 exclusive scan
+    uint oval = scan1Exclusive(idata4.w, s_Data, size / 4);
+
+    idata4.x += oval;
+    idata4.y += oval;
+    idata4.z += oval;
+    idata4.w += oval;
+
+    return idata4;
+}
+
+//Exclusive vector scan: the array to be scanned is stored
+//in local thread memory scope as uint4
+inline __device__ uint4 scan4Exclusive(uint4 idata4, volatile uint *s_Data, uint size)
+{
+    uint4 odata4 = scan4Inclusive(idata4, s_Data, size);
+    odata4.x -= idata4.x;
+    odata4.y -= idata4.y;
+    odata4.z -= idata4.z;
+    odata4.w -= idata4.w;
+    return odata4;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Scan kernels
+////////////////////////////////////////////////////////////////////////////////
+__global__ void scanExclusiveShared(
+    uint4 *d_Dst,
+    uint4 *d_Src,
+    uint size
+)
+{
+    __shared__ uint s_Data[2 * THREADBLOCK_SIZE];
+
+    uint pos = blockIdx.x * blockDim.x + threadIdx.x;
+
+    //Load data
+    uint4 idata4 = d_Src[pos];
+
+    //Calculate exclusive scan
+    uint4 odata4 = scan4Exclusive(idata4, s_Data, size);
+
+    //Write back
+    d_Dst[pos] = odata4;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Interface function
+////////////////////////////////////////////////////////////////////////////////
+//Derived as 32768 (max power-of-two gridDim.x) * 4 * THREADBLOCK_SIZE
+//Due to scanExclusiveShared<<<>>>() 1D block addressing
+extern "C" const uint MAX_BATCH_ELEMENTS = 64 * 1048576;
+extern "C" const uint MIN_SHORT_ARRAY_SIZE = 4;
+extern "C" const uint MAX_SHORT_ARRAY_SIZE = 4 * THREADBLOCK_SIZE;
+
+static uint factorRadix2(uint &log2L, uint L)
+{
+    if (!L)
+    {
+        log2L = 0;
+        return 0;
+    }
+    else
+    {
+        for (log2L = 0; (L & 1) == 0; L >>= 1, log2L++);
+
+        return L;
+    }
+}
+
+static uint iDivUp(uint dividend, uint divisor)
+{
+    return ((dividend % divisor) == 0) ? (dividend / divisor) : (dividend / divisor + 1);
+}
+
+extern "C" size_t scanExclusiveShort(
+    uint *d_Dst,
+    uint *d_Src,
+    uint batchSize,
+    uint arrayLength
+)
+{
+    //Check power-of-two factorization
+    uint log2L;
+    uint factorizationRemainder = factorRadix2(log2L, arrayLength);
+    assert(factorizationRemainder == 1);
+
+    //Check supported size range
+    assert((arrayLength >= MIN_SHORT_ARRAY_SIZE) && (arrayLength <= MAX_SHORT_ARRAY_SIZE));
+
+    //Check total batch size limit
+    assert((batchSize * arrayLength) <= MAX_BATCH_ELEMENTS);
+
+    //Check all threadblocks to be fully packed with data
+    assert((batchSize * arrayLength) % (4 * THREADBLOCK_SIZE) == 0);
+
+    scanExclusiveShared<<<(batchSize * arrayLength) / (4 * THREADBLOCK_SIZE), THREADBLOCK_SIZE>>>(
+        (uint4 *)d_Dst,
+        (uint4 *)d_Src,
+        arrayLength
+    );
+
+    return THREADBLOCK_SIZE;
 }
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
@@ -178,24 +313,33 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
 	
-	const dim3 blockSize(16, 16);
-	const dim3 gridSize(numCols/blockSize.x+1, numRows/blockSize.y+1);
+	// 1)
+	size_t n = numRows * numCols;
+	int blockSize = 1024;
+	int gridSize = n / blockSize;
 	
 	float *d_intermediate, *d_out;
-	checkCudaErrors(cudaMalloc(&d_intermediate, blockSize.x*blockSize.y*sizeof(float)));
+	checkCudaErrors(cudaMalloc(&d_intermediate, n * sizeof(float)));
 	checkCudaErrors(cudaMalloc(&d_out, sizeof(float)));
 	
 	float h_out;
-	max_reduce<<<gridSize, blockSize, blockSize.x*blockSize.y*sizeof(float)>>>(d_intermediate, d_logLuminance, numRows, numCols);
-	max_reduce<<<gridSize, blockSize, blockSize.x*blockSize.y*sizeof(float)>>>(d_out, d_intermediate, numRows, numCols);
+	reduce<<<gridSize, blockSize, blockSize * sizeof(float)>>>(d_intermediate, d_logLuminance, OP_MAX);
+	reduce<<<gridSize, blockSize, blockSize * sizeof(float)>>>(d_out, d_intermediate, OP_MAX);
 	checkCudaErrors(cudaMemcpy(&h_out, d_out, sizeof(float), cudaMemcpyDeviceToHost));
 	max_logLum = h_out;
 	
-	min_reduce<<<gridSize, blockSize, blockSize.x*blockSize.y*sizeof(float)>>>(d_intermediate, d_logLuminance, numRows, numCols);
-	min_reduce<<<gridSize, blockSize, blockSize.x*blockSize.y*sizeof(float)>>>(d_out, d_intermediate, numRows, numCols);
+	reduce<<<gridSize, blockSize, blockSize * sizeof(float)>>>(d_intermediate, d_logLuminance, OP_MIN);
+	reduce<<<gridSize, blockSize, blockSize * sizeof(float)>>>(d_out, d_intermediate, OP_MIN);
 	checkCudaErrors(cudaMemcpy(&h_out, d_out, sizeof(float), cudaMemcpyDeviceToHost));
 	min_logLum = h_out;
-	
+
 	checkCudaErrors(cudaFree(d_intermediate));
 	checkCudaErrors(cudaFree(d_out));
+
+	uint *d_bins;
+	checkCudaErrors(cudaMalloc(&d_bins, numBins * sizeof(uint)));
+	checkCudaErrors(cudaMemset(d_bins, 0, numBins * sizeof(uint)));
+	histogram<<<gridSize, blockSize, blockSize * sizeof(float)>>>(d_bins, d_logLuminance, min_logLum, max_logLum, numBins);
+
+	scanExclusiveShort(d_cdf, d_bins, 1, numBins);
 }

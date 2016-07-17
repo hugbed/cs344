@@ -1,0 +1,7 @@
+*.project
+*.cproject
+/HW3
+/HW3_differenceImage.png
+/HW3_reference.png
+/memorial_png_large_bw.png
+*.png
