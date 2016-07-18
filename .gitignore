@@ -22,3 +22,5 @@
 build
 bin
 
+RemoteSystemsTempFiles/
+.metadata/

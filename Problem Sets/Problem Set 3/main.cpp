@@ -86,6 +86,10 @@ int main(int argc, char **argv) {
   your_histogram_and_prefixsum(d_luminance, d_cdf, min_logLum, max_logLum,
                                numRows, numCols, numBins);
   timer.Stop();
+
+  printf("Max lum found : %f\n", max_logLum);
+  printf("Min lum found : %f\n", min_logLum);
+
   cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
   int err = printf("Your code ran in: %f msecs.\n", timer.Elapsed());
 

@@ -15,8 +15,8 @@ OPENCV_INCLUDEPATH=/usr/local/include
 #OPENCV_LIBPATH=/usr/local/lib
 #OPENCV_INCLUDEPATH=/usr/local/include
 
-OPENCV_LIBS=-lopencv_core -lopencv_imgproc -lopencv_highgui -lopencv_imgcodecs
-CUDA_INCLUDEPATH=/usr/local/cuda-7.5/include
+OPENCV_LIBS=-lopencv_core -lopencv_imgproc -lopencv_highgui
+CUDA_INCLUDEPATH=${CUDA_HOME}/include
 
 ######################################################
 # On Macs the default install locations are below    #
@@ -46,3 +46,8 @@ reference_calc.o: reference_calc.cpp reference_calc.h
 
 clean:
 	rm -f *.o *.png hw
+
+run:
+	./HW2 cinque_terre_small.jpg cinque_terre_small_bw.jpg; \
+	xdg-open cinque_terre_small_bw.jpg	
+
