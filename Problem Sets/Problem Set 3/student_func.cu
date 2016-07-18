@@ -87,8 +87,6 @@
 #define OP_MAX 3
 #define OP_MIN 2
 
-#define THREADBLOCK_SIZE 256
-
 typedef unsigned int uint;
 
 __global__ 
@@ -137,161 +135,96 @@ void histogram(uint* d_bins,
 	s_in[tid] = d_in[i];
 	__syncthreads();
 
-	// could initialize to 0 some way here
-	// here <--
-
-	// could build histogram in shared memory, then
-	// merge it to global histogram
-
 	float lumRange = lumMax - lumMin;
 	unsigned int binIdx = (s_in[tid] - lumMin) / lumRange * numBins;
 
-	// could probably be faster somehow else
 	atomicAdd(&(d_bins[binIdx]), 1);
 }
 
-
-////////////////////////////////////////////////////////////////////////////////
-// Basic scan codelets
-////////////////////////////////////////////////////////////////////////////////
-//Naive inclusive scan: O(N * log2(N)) operations
-//Allocate 2 * 'size' local memory, initialize the first half
-//with 'size' zeros avoiding if(pos >= offset) condition evaluation
-//and saving instructions
-inline __device__ uint scan1Inclusive(uint idata, volatile uint *s_Data, uint size)
+__global__ void partialPreScan(uint *d_odata, uint *d_oblockSums, const uint *d_idata, uint n)
 {
-    uint pos = 2 * threadIdx.x - (threadIdx.x & (size - 1));
-    s_Data[pos] = 0;
-    pos += size;
-    s_Data[pos] = idata;
-
-    for (uint offset = 1; offset < size; offset <<= 1)
-    {
-        __syncthreads();
-        uint t = s_Data[pos] + s_Data[pos - offset];
-        __syncthreads();
-        s_Data[pos] = t;
-    }
-
-    return s_Data[pos];
+	/*
+	 * For large arrays, do this operation with multiple blocks then
+	 * do it again with one block with the blockSums to scan the blockSums
+	 * call addScannedBlockSums with the scanned blockSums to merge the blocks.
+	 * 
+	 * Each block must have blockDim.x * sizeof(uint) as shared memory
+	 */
+	
+	 extern __shared__ uint s_temp[];// allocated on invocation
+	 
+	 // copy into shared memory
+	 const uint tid = threadIdx.x;
+	 const uint id = blockIdx.x * blockDim.x + tid;
+	 
+     // pad the smaller block
+	 if (id < n) {
+		 s_temp[tid] = d_idata[id];
+	 } else {
+		 s_temp[tid] = 0;
+	 }
+	 __syncthreads();
+	 
+	 // upsweap
+	 int offset = 1;
+	 for (; offset < blockDim.x; offset <<= 1) {
+		 if ((tid + 1) % (offset << 1) == 0) {
+			 s_temp[tid] += s_temp[tid - offset];
+		 }
+		 __syncthreads();
+	 }
+	 
+	 // reset last value to identity element
+	 if (tid == (blockDim.x - 1)) {
+		 d_oblockSums[blockIdx.x] = s_temp[tid];
+		 s_temp[tid] = 0;
+	 }
+	 __syncthreads();
+	 
+	 // downsweap
+	 for (;offset > 0; offset >>= 1) {
+		 if ((tid + 1) % (offset << 1) == 0) {
+			 uint old = s_temp[tid - offset];
+			 s_temp[tid - offset] = s_temp[tid];
+			 s_temp[tid] += old;
+		 }
+		 __syncthreads();
+	 }
+	 
+	 // copy result to global memory
+	 if (id < n) {
+		 d_odata[id] = s_temp[tid];
+	 }
 }
 
-inline __device__ uint scan1Exclusive(uint idata, volatile uint *s_Data, uint size)
+__global__ void addScannedBlockSums(uint* d_data, uint* d_isums, const size_t n)
 {
-    return scan1Inclusive(idata, s_Data, size) - idata;
+	const uint id = blockIdx.x * blockDim.x + threadIdx.x;
+	if (id < n) {
+		d_data[id] += d_isums[blockIdx.x]; 
+	}
 }
 
-
-inline __device__ uint4 scan4Inclusive(uint4 idata4, volatile uint *s_Data, uint size)
+void preScan(uint *d_odata, const uint *d_idata, const uint threadsPerBlock, const uint N)
 {
-    //Level-0 inclusive scan
-    idata4.y += idata4.x;
-    idata4.z += idata4.y;
-    idata4.w += idata4.z;
+	assert(threadsPerBlock < N);
+	
+	uint nbBlocks = N/threadsPerBlock;
 
-    //Level-1 exclusive scan
-    uint oval = scan1Exclusive(idata4.w, s_Data, size / 4);
-
-    idata4.x += oval;
-    idata4.y += oval;
-    idata4.z += oval;
-    idata4.w += oval;
-
-    return idata4;
-}
-
-//Exclusive vector scan: the array to be scanned is stored
-//in local thread memory scope as uint4
-inline __device__ uint4 scan4Exclusive(uint4 idata4, volatile uint *s_Data, uint size)
-{
-    uint4 odata4 = scan4Inclusive(idata4, s_Data, size);
-    odata4.x -= idata4.x;
-    odata4.y -= idata4.y;
-    odata4.z -= idata4.z;
-    odata4.w -= idata4.w;
-    return odata4;
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Scan kernels
-////////////////////////////////////////////////////////////////////////////////
-__global__ void scanExclusiveShared(
-    uint4 *d_Dst,
-    uint4 *d_Src,
-    uint size
-)
-{
-    __shared__ uint s_Data[2 * THREADBLOCK_SIZE];
-
-    uint pos = blockIdx.x * blockDim.x + threadIdx.x;
-
-    //Load data
-    uint4 idata4 = d_Src[pos];
-
-    //Calculate exclusive scan
-    uint4 odata4 = scan4Exclusive(idata4, s_Data, size);
-
-    //Write back
-    d_Dst[pos] = odata4;
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Interface function
-////////////////////////////////////////////////////////////////////////////////
-//Derived as 32768 (max power-of-two gridDim.x) * 4 * THREADBLOCK_SIZE
-//Due to scanExclusiveShared<<<>>>() 1D block addressing
-extern "C" const uint MAX_BATCH_ELEMENTS = 64 * 1048576;
-extern "C" const uint MIN_SHORT_ARRAY_SIZE = 4;
-extern "C" const uint MAX_SHORT_ARRAY_SIZE = 4 * THREADBLOCK_SIZE;
-
-static uint factorRadix2(uint &log2L, uint L)
-{
-    if (!L)
-    {
-        log2L = 0;
-        return 0;
-    }
-    else
-    {
-        for (log2L = 0; (L & 1) == 0; L >>= 1, log2L++);
-
-        return L;
-    }
-}
-
-static uint iDivUp(uint dividend, uint divisor)
-{
-    return ((dividend % divisor) == 0) ? (dividend / divisor) : (dividend / divisor + 1);
-}
-
-extern "C" size_t scanExclusiveShort(
-    uint *d_Dst,
-    uint *d_Src,
-    uint batchSize,
-    uint arrayLength
-)
-{
-    //Check power-of-two factorization
-    uint log2L;
-    uint factorizationRemainder = factorRadix2(log2L, arrayLength);
-    assert(factorizationRemainder == 1);
-
-    //Check supported size range
-    assert((arrayLength >= MIN_SHORT_ARRAY_SIZE) && (arrayLength <= MAX_SHORT_ARRAY_SIZE));
-
-    //Check total batch size limit
-    assert((batchSize * arrayLength) <= MAX_BATCH_ELEMENTS);
-
-    //Check all threadblocks to be fully packed with data
-    assert((batchSize * arrayLength) % (4 * THREADBLOCK_SIZE) == 0);
-
-    scanExclusiveShared<<<(batchSize * arrayLength) / (4 * THREADBLOCK_SIZE), THREADBLOCK_SIZE>>>(
-        (uint4 *)d_Dst,
-        (uint4 *)d_Src,
-        arrayLength
-    );
-
-    return THREADBLOCK_SIZE;
+	// Init partial block sums array
+	uint *d_osums;
+	checkCudaErrors(cudaMalloc((void**)&d_osums, nbBlocks * sizeof(uint)));
+	
+	// Scan with multiple independant blocks
+	partialPreScan<<<nbBlocks, threadsPerBlock, threadsPerBlock*sizeof(uint)>>>(d_odata, d_osums, d_idata, N);
+	
+	// Scan the sum of these blocks
+	uint *d_totalSum;
+	checkCudaErrors(cudaMalloc((void**)&d_totalSum, sizeof(uint)));
+	partialPreScan<<<1, nbBlocks, nbBlocks*sizeof(uint)>>>(d_osums, d_totalSum, d_osums, N);
+	
+	// Add the blockSums to the other independant blocks
+	addScannedBlockSums<<<nbBlocks, threadsPerBlock>>>(d_odata, d_osums, N);
 }
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
@@ -341,5 +274,5 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
 	checkCudaErrors(cudaMemset(d_bins, 0, numBins * sizeof(uint)));
 	histogram<<<gridSize, blockSize, blockSize * sizeof(float)>>>(d_bins, d_logLuminance, min_logLum, max_logLum, numBins);
 
-	scanExclusiveShort(d_cdf, d_bins, 1, numBins);
+	preScan(d_cdf, d_bins, numBins/4, numBins);
 }
