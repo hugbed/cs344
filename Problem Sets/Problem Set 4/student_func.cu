@@ -43,6 +43,7 @@
  */
 
 #define THREADS_PER_BLOCK 512
+#define NB_BLOCKS(n)(ceil(float(n)/float(THREADS_PER_BLOCK)))
 
 typedef unsigned int uint;
 
@@ -130,15 +131,24 @@ __global__ void addScannedBlockSums(uint* d_data, uint* d_isums, const size_t n)
 	}
 }
 
+uint *d_osums;
+
+void initPreScan(const uint numElems)
+{
+	const uint nbBlocks = NB_BLOCKS(numElems);
+	checkCudaErrors(cudaMalloc((void**)&d_osums, nbBlocks * sizeof(uint)));
+}
+
+void cleanPreScan()
+{
+	checkCudaErrors(cudaFree(d_osums));
+}
+
 void preScan(uint *d_odata, uint *d_osum, const uint *d_idata, const uint N)
 {
-	const uint nbBlocks = ceil(float(N)/float(THREADS_PER_BLOCK));
+	const uint nbBlocks = NB_BLOCKS(N);
 
-	uint *d_osums;
-	checkCudaErrors(cudaMalloc((void**)&d_osums, nbBlocks * sizeof(uint)));
-	
 	// Scan with multiple independant blocks
-	checkCudaErrors(cudaMemset(d_osums, 0, nbBlocks*sizeof(unsigned int)));
 	partialPreScan<<<nbBlocks, THREADS_PER_BLOCK, THREADS_PER_BLOCK*sizeof(uint)>>>(d_odata, d_osums, d_idata, N);
 	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 	
@@ -152,16 +162,18 @@ void preScan(uint *d_odata, uint *d_osum, const uint *d_idata, const uint N)
 	// Add the block sums to the other independant blocks
 	addScannedBlockSums<<<nbBlocks, THREADS_PER_BLOCK>>>(d_odata, d_osums, N);
 	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
-	
-	checkCudaErrors(cudaFree(d_osums));
 }
 
 __global__ void scatter(uint* d_odata, const uint* d_idata,
 						const uint* d_zeroScan, const uint* d_oneScan,
 						const uint* d_zeroPredicate,
-						const uint* numZeros)
+						const uint* numZeros,
+						const uint numElems)
 {
 	const uint id = blockDim.x * blockIdx.x + threadIdx.x;
+	
+	if (id >= numElems)
+		return;
 	
 	uint newAddr;
 	if (d_zeroPredicate[id] == 1) {
@@ -170,6 +182,9 @@ __global__ void scatter(uint* d_odata, const uint* d_idata,
 		newAddr = d_oneScan[id] + (*numZeros);
 	}
 	
+	if (newAddr >= numElems) {
+		return;
+	}
 	d_odata[newAddr] = d_idata[id];
 }
 
@@ -180,21 +195,7 @@ void your_sort(unsigned int* const d_inputVals,
                unsigned int* const d_outputPos,
                const size_t numElems)
 { 
-	/*
-	* radix_sort(in):
-	* 	  for each bit:
-	* 	   	  1) numZeros
-	* 		  2) Predicate : 
-	* 	  		  p_0[i] = (val[i] & bit) == 0
-	* 			  p_1[i] = ~p_0
-	* 		  3) Exclusive sum-scan for p_0 and p_1
-	* 	       	  -->presum_0 = ex_sum_scan(p_0)	(gives adresses to put sorted in into out)
-	* 	       	  -->presum_1 = ex_sum_scan(p_1)
-	* 	       	      -->presum_1[i] += numZeros
-	* 	      4) out <-- compact(in, presum_0)		(check for bounds)
-	* 	         out <-- compact(in, presum_1)
-	*/
-//	initPreScan(numElems);
+	initPreScan(numElems);
 	
 	uint *d_isZeroPredicate, *d_isOnePredicate;
 	checkCudaErrors(cudaMalloc(&d_isZeroPredicate, numElems*sizeof(uint)));
@@ -209,60 +210,60 @@ void your_sort(unsigned int* const d_inputVals,
 	checkCudaErrors(cudaMalloc((void **)&d_nbOnes, sizeof(uint)));
 	
 	const uint NB_BITS = 32;
+	const uint nbBlocks = NB_BLOCKS(numElems);
+	const uint nbThreadsPerBlock = THREADS_PER_BLOCK;
 	
-	uint bitOffset = 0;
-//	for (uint bitOffset = 0; bitOffset < NB_BITS; bitOffset++) {
+	for (uint bitOffset = 0; bitOffset < NB_BITS; bitOffset++) {
+		// compute predicate values
+		if ((bitOffset + 1) % 2 == 1) {
+			bitIsZeroPredicate<<<nbBlocks, nbThreadsPerBlock>>>(
+							d_isZeroPredicate, 
+							d_isOnePredicate, 
+							d_inputVals, 
+							bitOffset,
+							numElems);
+		} else {
+			bitIsZeroPredicate<<<nbBlocks, nbThreadsPerBlock>>>(
+							d_isZeroPredicate, 
+							d_isOnePredicate, 
+							d_outputVals, 
+							bitOffset,
+							numElems);			
+		}
 		
-	// compute predicate values
-	uint numThreadsPerBlock = 256;
-	uint numBlocks = numElems/numThreadsPerBlock + 1;
-	bitIsZeroPredicate<<<numBlocks, numThreadsPerBlock>>>(
-			d_isZeroPredicate, 
-			d_isOnePredicate, 
-			d_inputVals, 
-			bitOffset,
-			numElems);
+		// compute pre scan of both predicates
+		preScan(d_isZeroScan, d_nbZeros, d_isZeroPredicate, numElems);
+		preScan(d_isOneScan, d_nbOnes, d_isOnePredicate, numElems);
+		
+		// put the sorted result at its correct index
+		// flip input/output each turn
+		if ((bitOffset + 1) % 2 == 1) {
+			scatter<<<nbBlocks, nbThreadsPerBlock>>>(
+					d_outputVals, d_inputVals,
+					d_isZeroScan, d_isOneScan,
+					d_isZeroPredicate,
+					d_nbZeros, numElems);
+			scatter<<<nbBlocks, nbThreadsPerBlock>>>(
+					d_outputPos, d_inputPos,
+					d_isZeroScan, d_isOneScan,
+					d_isZeroPredicate,
+					d_nbZeros, numElems);	
+		} else {
+			scatter<<<nbBlocks, nbThreadsPerBlock>>>(
+					d_inputVals, d_outputVals,
+					d_isZeroScan, d_isOneScan,
+					d_isZeroPredicate,
+					d_nbZeros, numElems);
+			scatter<<<nbBlocks, nbThreadsPerBlock>>>(
+					d_inputPos, d_outputPos,
+					d_isZeroScan, d_isOneScan,
+					d_isZeroPredicate,
+					d_nbZeros, numElems);
+		}
+	}
 	
-	// compute pre scan of both predicates
-	preScan(d_isZeroScan, d_nbZeros, d_isZeroPredicate, numElems);
-	preScan(d_isOneScan, d_nbOnes, d_isOnePredicate, numElems);
-
-	uint * h_nbZeros = new uint[numElems];
-	uint * h_nbOnes = new uint[numElems];
-	checkCudaErrors(cudaMemcpy(h_nbZeros, d_nbZeros, sizeof(uint), cudaMemcpyDeviceToHost));
-	checkCudaErrors(cudaMemcpy(h_nbOnes, d_nbOnes, sizeof(uint), cudaMemcpyDeviceToHost));
+	cleanPreScan();
 	
-	printf("nbZeros: %d, %d\n", *h_nbZeros, *h_nbOnes);
-	
-//	// put the sorted result at its correct index
-//	// flip input/output each turn
-//	if ((bitOffset + 1) % 2 == 1) {
-//		scatter<<<gridSize, blockSize>>>(
-//				d_inputVals, d_outputVals,
-//				d_isZeroScan, d_isOneScan,
-//				d_isZeroPredicate,
-//				nbZeros);
-//		scatter<<<gridSize, blockSize>>>(
-//				d_inputPos, d_outputPos,
-//				d_isZeroScan, d_isOneScan,
-//				d_isZeroPredicate,
-//				nbZeros);	
-//	} else {
-//		scatter<<<gridSize, blockSize>>>(
-//				d_outputVals, d_inputVals,
-//				d_isZeroScan, d_isOneScan,
-//				d_isZeroPredicate,
-//				nbZeros);
-//		scatter<<<gridSize, blockSize>>>(
-//				d_outputPos, d_inputPos,
-//				d_isZeroScan, d_isOneScan,
-//				d_isZeroPredicate,
-//				nbZeros);
-//	}
-//	}
-	
-//	cleanPreScan();
-			
 	checkCudaErrors(cudaFree(d_isZeroPredicate));
 	checkCudaErrors(cudaFree(d_isOnePredicate));
 	checkCudaErrors(cudaFree(d_isZeroScan));
