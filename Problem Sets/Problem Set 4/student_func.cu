@@ -42,6 +42,8 @@
 
  */
 
+#define THREADS_PER_BLOCK 512
+
 typedef unsigned int uint;
 
 __global__
@@ -57,10 +59,10 @@ void bitIsZeroPredicate(uint* d_oTruePredicate,
 		return;
 	}
 	
-	int predicate = static_cast<uint>((d_iData[id] & 1 << offsetFromMSB) == 0);
+	uint predicate = static_cast<uint>((d_iData[id] & 1 << offsetFromMSB) == 0);
 	
 	d_oTruePredicate[id] = predicate;
-	d_oFalsePredicate[id] = ~predicate;
+	d_oFalsePredicate[id] = (1 - predicate);
 }
 
 
@@ -79,7 +81,7 @@ __global__ void partialPreScan(uint *d_odata, uint *d_oblockSums, const uint *d_
 	 // copy into shared memory
 	 const uint tid = threadIdx.x;
 	 const uint id = blockIdx.x * blockDim.x + tid;
-	 
+	  
      // pad the smaller block
 	 if (id < n) {
 		 s_temp[tid] = d_idata[id];
@@ -96,7 +98,7 @@ __global__ void partialPreScan(uint *d_odata, uint *d_oblockSums, const uint *d_
 		 }
 		 __syncthreads();
 	 }
-	 
+
 	 // reset last value to identity element
 	 if (tid == (blockDim.x - 1)) {
 		 d_oblockSums[blockIdx.x] = s_temp[tid];
@@ -128,31 +130,30 @@ __global__ void addScannedBlockSums(uint* d_data, uint* d_isums, const size_t n)
 	}
 }
 
-uint preScan(uint *d_odata, const uint *d_idata, const uint N, const uint threadsPerBlock = 256)
+void preScan(uint *d_odata, uint *d_osum, const uint *d_idata, const uint N)
 {
-	assert(threadsPerBlock < N);
-	
-	uint nbBlocks = N/threadsPerBlock;
+	const uint nbBlocks = ceil(float(N)/float(THREADS_PER_BLOCK));
 
-	// Init partial block sums array
 	uint *d_osums;
 	checkCudaErrors(cudaMalloc((void**)&d_osums, nbBlocks * sizeof(uint)));
 	
 	// Scan with multiple independant blocks
-	partialPreScan<<<nbBlocks, threadsPerBlock, threadsPerBlock*sizeof(uint)>>>(d_odata, d_osums, d_idata, N);
+	checkCudaErrors(cudaMemset(d_osums, 0, nbBlocks*sizeof(unsigned int)));
+	partialPreScan<<<nbBlocks, THREADS_PER_BLOCK, THREADS_PER_BLOCK*sizeof(uint)>>>(d_odata, d_osums, d_idata, N);
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 	
 	// Scan the sum of these blocks
-	uint *d_totalSum;
-	checkCudaErrors(cudaMalloc((void**)&d_totalSum, sizeof(uint)));
-	partialPreScan<<<1, nbBlocks, nbBlocks*sizeof(uint)>>>(d_osums, d_totalSum, d_osums, N);
+	partialPreScan<<<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK*sizeof(uint)>>>(d_osums, d_osum, d_osums, nbBlocks);
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+	
+	uint *h_osums = new uint[nbBlocks];
+	checkCudaErrors(cudaMemcpy(h_osums, d_osums, nbBlocks*sizeof(uint), cudaMemcpyDeviceToHost));
 	
 	// Add the block sums to the other independant blocks
-	addScannedBlockSums<<<nbBlocks, threadsPerBlock>>>(d_odata, d_osums, N);
+	addScannedBlockSums<<<nbBlocks, THREADS_PER_BLOCK>>>(d_odata, d_osums, N);
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 	
-	uint h_totalSum;
-	checkCudaErrors(cudaMemcpy(&h_totalSum, d_totalSum, sizeof(uint), cudaMemcpyDeviceToHost));
-	
-	return h_totalSum;
+	checkCudaErrors(cudaFree(d_osums));
 }
 
 __global__ void scatter(uint* d_odata, const uint* d_idata,
@@ -171,6 +172,7 @@ __global__ void scatter(uint* d_odata, const uint* d_idata,
 	
 	d_odata[newAddr] = d_idata[id];
 }
+
 
 void your_sort(unsigned int* const d_inputVals,
                unsigned int* const d_inputPos,
@@ -192,67 +194,77 @@ void your_sort(unsigned int* const d_inputVals,
 	* 	      4) out <-- compact(in, presum_0)		(check for bounds)
 	* 	         out <-- compact(in, presum_1)
 	*/
+//	initPreScan(numElems);
 	
 	uint *d_isZeroPredicate, *d_isOnePredicate;
 	checkCudaErrors(cudaMalloc(&d_isZeroPredicate, numElems*sizeof(uint)));
 	checkCudaErrors(cudaMalloc(&d_isOnePredicate, numElems*sizeof(uint)));
 	
 	uint *d_isZeroScan, *d_isOneScan;
-	checkCudaErrors(cudaMalloc((void **)&d_isZeroPredicate, numElems*sizeof(uint)));
-	checkCudaErrors(cudaMalloc((void **)&d_isOnePredicate, numElems*sizeof(uint)));
+	checkCudaErrors(cudaMalloc((void **)&d_isZeroScan, numElems*sizeof(uint)));
+	checkCudaErrors(cudaMalloc((void **)&d_isOneScan, numElems*sizeof(uint)));
+	
+	uint * d_nbZeros, * d_nbOnes;
+	checkCudaErrors(cudaMalloc((void **)&d_nbZeros, sizeof(uint)));
+	checkCudaErrors(cudaMalloc((void **)&d_nbOnes, sizeof(uint)));
 	
 	const uint NB_BITS = 32;
 	
-	for (uint bitOffset = 0; bitOffset < NB_BITS; bitOffset++) {
+	uint bitOffset = 0;
+//	for (uint bitOffset = 0; bitOffset < NB_BITS; bitOffset++) {
 		
-		// compute predicate values
-		uint numThreadsPerBlock = 256;
-		bitIsZeroPredicate<<<numElems/numThreadsPerBlock, numThreadsPerBlock>>>(
-				d_isZeroPredicate, 
-				d_isOnePredicate, 
-				d_inputVals, 
-				bitOffset,
-				numElems);
-		
-		// compute pre scan of both predicates
-		uint nbZeros = preScan(d_isZeroScan, d_isZeroPredicate, numElems);
-		uint nbOnes = preScan(d_isOneScan, d_isOnePredicate, numElems);
-		
-		// put the sorted result at its correct index
-		// flip input/output each turn
-		if ((bitOffset + 1) % 2 == 1) {
-			scatter<<<gridSize, blockSize>>>(
-					d_inputVals, d_outputVals,
-					d_isZeroScan, d_isOneScan,
-					d_isZeroPredicate,
-					nbZeros);
-			scatter<<<gridSize, blockSize>>>(
-					d_inputPos, d_outputPos,
-					d_isZeroScan, d_isOneScan,
-					d_isZeroPredicate,
-					nbZeros);	
-		} else {
-			scatter<<<gridSize, blockSize>>>(
-					d_outputVals, d_inputVals,
-					d_isZeroScan, d_isOneScan,
-					d_isZeroPredicate,
-					nbZeros);
-			scatter<<<gridSize, blockSize>>>(
-					d_outputPos, d_inputPos,
-					d_isZeroScan, d_isOneScan,
-					d_isZeroPredicate,
-					nbZeros);
-		}
-	}
+	// compute predicate values
+	uint numThreadsPerBlock = 256;
+	uint numBlocks = numElems/numThreadsPerBlock + 1;
+	bitIsZeroPredicate<<<numBlocks, numThreadsPerBlock>>>(
+			d_isZeroPredicate, 
+			d_isOnePredicate, 
+			d_inputVals, 
+			bitOffset,
+			numElems);
 	
+	// compute pre scan of both predicates
+	preScan(d_isZeroScan, d_nbZeros, d_isZeroPredicate, numElems);
+	preScan(d_isOneScan, d_nbOnes, d_isOnePredicate, numElems);
+
+	uint * h_nbZeros = new uint[numElems];
+	uint * h_nbOnes = new uint[numElems];
+	checkCudaErrors(cudaMemcpy(h_nbZeros, d_nbZeros, sizeof(uint), cudaMemcpyDeviceToHost));
+	checkCudaErrors(cudaMemcpy(h_nbOnes, d_nbOnes, sizeof(uint), cudaMemcpyDeviceToHost));
 	
-	/*
-	 *  for bitOffset from 0 to 32:
-	 *  	numZeros, numOnes = 0
-			filterBitValue(d_outputFiltered, numZeros, d_inputVals, bitOffset, 0, 0, numElems);
-			filterBitValue(d_outputFiltered, numOnes, d_inputVals, bitOffset, 1, numZeros, numElems);  
-	*/
+	printf("nbZeros: %d, %d\n", *h_nbZeros, *h_nbOnes);
 	
-	//TODO
-  //PUT YOUR SORT HERE
+//	// put the sorted result at its correct index
+//	// flip input/output each turn
+//	if ((bitOffset + 1) % 2 == 1) {
+//		scatter<<<gridSize, blockSize>>>(
+//				d_inputVals, d_outputVals,
+//				d_isZeroScan, d_isOneScan,
+//				d_isZeroPredicate,
+//				nbZeros);
+//		scatter<<<gridSize, blockSize>>>(
+//				d_inputPos, d_outputPos,
+//				d_isZeroScan, d_isOneScan,
+//				d_isZeroPredicate,
+//				nbZeros);	
+//	} else {
+//		scatter<<<gridSize, blockSize>>>(
+//				d_outputVals, d_inputVals,
+//				d_isZeroScan, d_isOneScan,
+//				d_isZeroPredicate,
+//				nbZeros);
+//		scatter<<<gridSize, blockSize>>>(
+//				d_outputPos, d_inputPos,
+//				d_isZeroScan, d_isOneScan,
+//				d_isZeroPredicate,
+//				nbZeros);
+//	}
+//	}
+	
+//	cleanPreScan();
+			
+	checkCudaErrors(cudaFree(d_isZeroPredicate));
+	checkCudaErrors(cudaFree(d_isOnePredicate));
+	checkCudaErrors(cudaFree(d_isZeroScan));
+	checkCudaErrors(cudaFree(d_isOneScan));
 }
