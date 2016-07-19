@@ -150,18 +150,12 @@ void preScan(uint *d_odata, uint *d_osum, const uint *d_idata, const uint N)
 
 	// Scan with multiple independant blocks
 	partialPreScan<<<nbBlocks, THREADS_PER_BLOCK, THREADS_PER_BLOCK*sizeof(uint)>>>(d_odata, d_osums, d_idata, N);
-	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 	
 	// Scan the sum of these blocks
 	partialPreScan<<<1, THREADS_PER_BLOCK, THREADS_PER_BLOCK*sizeof(uint)>>>(d_osums, d_osum, d_osums, nbBlocks);
-	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
-	
-	uint *h_osums = new uint[nbBlocks];
-	checkCudaErrors(cudaMemcpy(h_osums, d_osums, nbBlocks*sizeof(uint), cudaMemcpyDeviceToHost));
 	
 	// Add the block sums to the other independant blocks
 	addScannedBlockSums<<<nbBlocks, THREADS_PER_BLOCK>>>(d_odata, d_osums, N);
-	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 }
 
 __global__ void scatter(uint* d_odata, const uint* d_idata,
