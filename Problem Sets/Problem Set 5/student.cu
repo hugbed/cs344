@@ -27,17 +27,33 @@
 
 #include "utils.h"
 
-__global__
-void yourHisto(const unsigned int* const vals, //INPUT
-               unsigned int* const histo,      //OUPUT
-               int numVals)
-{
-  //TODO fill in this kernel to calculate the histogram
-  //as quickly as possible
+typedef unsigned int uint;
 
-  //Although we provide only one kernel skeleton,
-  //feel free to use more if it will help you
-  //write faster code
+#define VALS_PER_COARSE 256 // 2^8
+
+__global__
+void coarseBins(uint *oVals,
+				const uint *iVals,
+				const size_t numValsPerCoarse,
+				const size_t numVals)
+{
+	uint i = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (i >= numVals) {
+		return;
+	}
+
+	// Divide by the number of values per coarse bin
+	// to get the coarse bin index
+	oVals[i] = iVals[i] / numValsPerCoarse; // with iVals[i] >> 8 instead would be faster
+}
+
+__global__
+void yourHisto(const uint* const vals, //INPUT
+               uint* const histo,      //OUPUT
+               const size_t numVals)
+{
+
 }
 
 void computeHistogram(const unsigned int* const d_vals, //INPUT
@@ -45,10 +61,17 @@ void computeHistogram(const unsigned int* const d_vals, //INPUT
                       const unsigned int numBins,
                       const unsigned int numElems)
 {
-  //TODO Launch the yourHisto kernel
+	uint gridSize = 0;
+	uint blockSize = 0;
 
-  //if you want to use/launch more than one kernel,
-  //feel free
+	uint* d_coarseVals;
+	checkCudaErrors(cudaMalloc((void**)&d_coarseVals, numElems*sizeof(uint)));
+	coarseBins<<<gridSize, blockSize>>>(d_coarseVals, d_vals, VALS_PER_COARSE, numElems);
 
-  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+	uint *h_coarse = new uint[numElems];
+	checkCudaErrors()
+
+	printf("numElems: %d", numElems);
+
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 }
